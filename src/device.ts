@@ -1,7 +1,9 @@
-import * as Location from 'expo-location';
+﻿import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
-import { backendUserId, supabase } from './supabase';
+
+import { getAuthenticatedUserId, supabase } from './supabase';
+import { reportError } from './errors';
 
 export type DeviceLocation = {
   latitude: number;
@@ -50,14 +52,19 @@ export const registerForPushNotifications = async () => {
   }
 
   const token = await Notifications.getExpoPushTokenAsync();
-  if (supabase && backendUserId) {
-    const { error } = await supabase.from('device_tokens').upsert({
-      user_id: backendUserId,
-      token: token.data,
-      platform: Platform.OS,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id,token' });
+  const userId = await getAuthenticatedUserId();
+  if (supabase && userId) {
+    const { error } = await supabase.from('device_tokens').upsert(
+      {
+        user_id: userId,
+        token: token.data,
+        platform: Platform.OS,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'user_id,token' },
+    );
     if (error) {
+      reportError('registerForPushNotifications.upsert', error);
       throw error;
     }
   }

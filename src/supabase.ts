@@ -1,15 +1,31 @@
-import { createClient } from '@supabase/supabase-js';
+﻿import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
-const supabaseUrl = env.EXPO_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
+import { isSupabaseConfigured, supabaseAnonKey, supabaseUrl } from './config';
 
-export const supabase =
-  supabaseUrl && supabaseAnonKey
-    ? createClient(supabaseUrl, supabaseAnonKey, {
-        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
-      })
-    : null;
+export const supabase: SupabaseClient | null = isSupabaseConfigured
+  ? createClient(supabaseUrl as string, supabaseAnonKey as string, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+      },
+    })
+  : null;
 
-export const backendUserId = env.EXPO_PUBLIC_USER_ID ?? null;
-export const usesSupabase = Boolean(supabase && backendUserId);
+export const usesSupabase = Boolean(supabase);
+
+/**
+ * Resolves the signed-in user id from the Supabase session.
+ * Row Level Security policies key off `auth.uid()`, so every remote call
+ * must use the session user instead of a static environment value.
+ */
+export const getAuthenticatedUserId = async (): Promise<string | null> => {
+  if (!supabase) {
+    return null;
+  }
+  const { data, error } = await supabase.auth.getSession();
+  if (error) {
+    throw error;
+  }
+  return data.session?.user?.id ?? null;
+};

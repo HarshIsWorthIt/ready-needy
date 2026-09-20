@@ -1,9 +1,7 @@
+﻿import { paymentsEnabled } from './config';
 import { supabase } from './supabase';
 
-export const paymentsConfigured = Boolean(
-  (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
-    ?.EXPO_PUBLIC_PAYMENTS_ENABLED === 'true',
-);
+export const paymentsConfigured = paymentsEnabled;
 
 export const createRewardCheckout = async (requestId: string) => {
   if (!paymentsConfigured || !supabase) {

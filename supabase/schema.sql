@@ -269,3 +269,165 @@ END;
 $$;
 
 ALTER PUBLICATION supabase_realtime ADD TABLE public.requests;
+
+-- ---------------------------------------------------------------------------
+-- Production hardening
+-- ---------------------------------------------------------------------------
+
+-- Keep `updated_at` fresh on every row update.
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS users_set_updated_at ON public.users;
+CREATE TRIGGER users_set_updated_at
+  BEFORE UPDATE ON public.users
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS requests_set_updated_at ON public.requests;
+CREATE TRIGGER requests_set_updated_at
+  BEFORE UPDATE ON public.requests
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS user_preferences_set_updated_at ON public.user_preferences;
+CREATE TRIGGER user_preferences_set_updated_at
+  BEFORE UPDATE ON public.user_preferences
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+-- Recompute a user's average rating whenever a new rating lands.
+CREATE OR REPLACE FUNCTION public.refresh_user_rating()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  UPDATE public.users
+  SET rating = COALESCE((
+    SELECT ROUND(AVG(rating)::numeric, 2)
+    FROM public.ratings
+    WHERE to_user_id = NEW.to_user_id
+  ), 0)
+  WHERE id = NEW.to_user_id;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS ratings_refresh_user_rating ON public.ratings;
+CREATE TRIGGER ratings_refresh_user_rating
+  AFTER INSERT ON public.ratings
+  FOR EACH ROW EXECUTE FUNCTION public.refresh_user_rating();
+
+-- Ready users must be able to discover nearby open requests so the
+-- "Incoming Signal" feed works. Only minimal dispatch fields are exposed and
+-- only while the request is still matching.
+DROP POLICY IF EXISTS requests_ready_discovery ON public.requests;
+CREATE POLICY requests_ready_discovery ON public.requests
+  FOR SELECT USING (
+    status IN ('SEARCHING', 'PARTIALLY_MATCHED')
+    AND EXISTS (
+      SELECT 1 FROM public.user_modes um
+      WHERE um.user_id = auth.uid()
+        AND um.mode = 'READY'
+        AND um.latitude IS NOT NULL
+        AND um.longitude IS NOT NULL
+        AND ST_DWithin(
+          ST_SetSRID(ST_MakePoint(requests.longitude, requests.latitude), 4326)::geography,
+          ST_SetSRID(ST_MakePoint(um.longitude, um.latitude), 4326)::geography,
+          GREATEST(requests.search_radius, 1000)
+        )
+    )
+  );
+
+-- Expire stale requests so the dispatch feed never shows dead signals.
+CREATE OR REPLACE FUNCTION public.expire_stale_requests()
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  expired_count integer;
+BEGIN
+  UPDATE public.requests
+  SET status = 'EXPIRED'
+  WHERE status IN ('SEARCHING', 'PARTIALLY_MATCHED')
+    AND created_at < now() - INTERVAL '2 hours';
+  GET DIAGNOSTICS expired_count = ROW_COUNT;
+  RETURN expired_count;
+END;
+$$;
+
+-- Guard the accept RPC against self-acceptance and unauthenticated callers.
+CREATE OR REPLACE FUNCTION public.accept_helper_for_request(
+  p_request_id uuid,
+  p_ready_user_id uuid
+)
+RETURNS TABLE (
+  id uuid,
+  task_description text,
+  helpers_required integer,
+  reward_per_helper integer,
+  duration text,
+  search_radius integer,
+  accepted_count integer,
+  status text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  current_request public.requests%ROWTYPE;
+  current_count integer;
+BEGIN
+  IF p_ready_user_id IS DISTINCT FROM auth.uid() THEN
+    RAISE EXCEPTION 'You can only accept requests as yourself';
+  END IF;
+
+  SELECT * INTO current_request
+  FROM public.requests
+  WHERE public.requests.id = p_request_id
+  FOR UPDATE;
+
+  IF NOT FOUND
+    OR current_request.status NOT IN ('SEARCHING', 'PARTIALLY_MATCHED')
+    OR current_request.needy_user_id = p_ready_user_id THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO public.request_helpers (request_id, ready_user_id, accepted_at, status)
+  VALUES (p_request_id, p_ready_user_id, now(), 'ACCEPTED')
+  ON CONFLICT (request_id, ready_user_id) DO NOTHING;
+
+  SELECT count(*)::integer INTO current_count
+  FROM public.request_helpers
+  WHERE request_helpers.request_id = p_request_id
+    AND request_helpers.status IN ('ACCEPTED', 'ASSIGNED', 'TRAVELLING', 'ARRIVED', 'WORKING', 'COMPLETED');
+
+  UPDATE public.requests
+  SET status = CASE
+    WHEN current_count >= current_request.helpers_required THEN 'MATCHED'
+    ELSE 'PARTIALLY_MATCHED'
+  END
+  WHERE requests.id = p_request_id;
+
+  RETURN QUERY
+  SELECT
+    current_request.id,
+    current_request.task_description,
+    current_request.helpers_required,
+    current_request.reward_per_helper,
+    current_request.duration,
+    current_request.search_radius,
+    current_count,
+    CASE
+      WHEN current_count >= current_request.helpers_required THEN 'MATCHED'
+      ELSE 'PARTIALLY_MATCHED'
+    END;
+END;
+$$;

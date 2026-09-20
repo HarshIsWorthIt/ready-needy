@@ -12,19 +12,30 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 
-import { clampRequestCount, computeNextSignalState } from './src/logic';
+import { clampRequestCount, computeNextSignalState, isValidEmail, parseRequestForm } from './src/logic';
 import { defaultRequest, helperProfiles, seedSignals, userName } from './src/mockData';
 import {
   acceptHelperForRequestRemote,
+  cancelRequestRemote,
+  completeRequestRemote,
   createNeedRequestRemote,
+  submitRatingRemote,
   subscribeToRequest,
   updateUserModeRemote,
   updateUserPreferencesRemote,
 } from './src/repository';
 import { RequestFormState, Screen, Signal, UserMode } from './src/types';
 import { registerForPushNotifications, requestCurrentLocation } from './src/device';
-import { getAuthSession, signOut, subscribeToAuthChanges } from './src/auth';
+import {
+  ensureUserProfile,
+  getAuthSession,
+  sendMagicLink,
+  signOut,
+  subscribeToAuthChanges,
+} from './src/auth';
 import { requestCameraPermission, requestNotificationPermission } from './src/permissions';
+import { toUserMessage } from './src/errors';
+import { APP_VERSION } from './src/config';
 
 function LiveBackground() {
   const drift = React.useRef(new Animated.Value(0)).current;
@@ -78,6 +89,12 @@ export default function App() {
   const [busySignalId, setBusySignalId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [profileName, setProfileName] = useState(userName);
+  const [authUserId, setAuthUserId] = useState<string | null>(null);
+  const [authEmail, setAuthEmail] = useState('');
+  const [magicEmail, setMagicEmail] = useState('');
+  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [ratingComment, setRatingComment] = useState('');
 
   const readyMode = userMode === 'READY';
   const readyCount = useMemo(() => Math.max(18, 20 + (readyMode ? 6 : 0)), [readyMode]);
@@ -124,25 +141,76 @@ export default function App() {
   }, [feedback]);
 
   useEffect(() => {
-    void getAuthSession().then((session) => {
-      if (session) {
+    void (async () => {
+      try {
+        const session = await getAuthSession();
+        if (!session) {
+          return;
+        }
         setIsLoggedIn(true);
         setScreen('home');
+        const profile = await ensureUserProfile();
+        if (profile) {
+          setProfileName(profile.name);
+          setAuthUserId(profile.id);
+          setAuthEmail(profile.email ?? '');
+        }
+      } catch (error) {
+        setFeedback(toUserMessage(error));
       }
-    }).catch(() => setFeedback('We could not restore your account session.'));
+    })();
   }, []);
 
   useEffect(() => subscribeToAuthChanges(
-    () => setIsLoggedIn(true),
+    () => {
+      setIsLoggedIn(true);
+      void ensureUserProfile()
+        .then((profile) => {
+          if (profile) {
+            setProfileName(profile.name);
+            setAuthUserId(profile.id);
+            setAuthEmail(profile.email ?? '');
+          }
+        })
+        .catch((error) => setFeedback(toUserMessage(error)));
+    },
     () => {
       setIsLoggedIn(false);
+      setAuthUserId(null);
+      setProfileName(userName);
       setScreen('welcome');
     },
   ), []);
 
   const handleLogin = () => {
-    setIsLoggedIn(true);
-    setScreen('verification');
+    if (isLoggedIn) {
+      setScreen('verification');
+      return;
+    }
+    setScreen('login');
+  };
+
+  const handleSendMagicLink = async () => {
+    if (!isValidEmail(magicEmail)) {
+      setFeedback('Enter a valid email address to receive your sign-in link.');
+      return;
+    }
+
+    setIsSigningIn(true);
+    try {
+      const result = await sendMagicLink(magicEmail);
+      if (result.demo) {
+        setIsLoggedIn(true);
+        setScreen('verification');
+        setFeedback('Demo mode: Supabase is not configured, continuing with a local session.');
+      } else {
+        setFeedback('Check your email and tap the sign-in link to continue.');
+      }
+    } catch (error) {
+      setFeedback(toUserMessage(error));
+    } finally {
+      setIsSigningIn(false);
+    }
   };
 
   const finishOnboarding = () => {
@@ -215,24 +283,10 @@ export default function App() {
   };
 
   const handleBroadcastNeed = async () => {
-    const helperCount = Number(requestForm.helpers);
-    const reward = Number(requestForm.reward);
-    const radius = Number.parseFloat(requestForm.radius);
-
-    if (!requestForm.task.trim()) {
-      setFeedback('Add a short description so nearby helpers know what you need.');
-      return;
-    }
-    if (!Number.isFinite(helperCount) || helperCount < 1 || helperCount > 20) {
-      setFeedback('Choose between 1 and 20 helpers.');
-      return;
-    }
-    if (!Number.isFinite(reward) || reward < 1) {
-      setFeedback('Add a valid reward per helper.');
-      return;
-    }
-    if (!Number.isFinite(radius) || radius <= 0 || radius > 25) {
-      setFeedback('Use a search radius between 0.1 and 25 km.');
+    try {
+      parseRequestForm(requestForm);
+    } catch (error) {
+      setFeedback(toUserMessage(error));
       return;
     }
 
@@ -275,7 +329,7 @@ export default function App() {
     setBusySignalId(signalId);
 
     try {
-      const acceptedSignal = await acceptHelperForRequestRemote(signalId, 'u2');
+      const acceptedSignal = await acceptHelperForRequestRemote(signalId);
       if (acceptedSignal) {
         setSignals((previous) =>
           previous.map((signal) => (signal.id === signalId ? acceptedSignal : signal)),
@@ -318,8 +372,15 @@ export default function App() {
     setScreen('home');
   };
 
-  const handleCancelRequest = () => {
+  const handleCancelRequest = async () => {
     if (!activeRequest) {
+      return;
+    }
+
+    try {
+      await cancelRequestRemote(activeRequest.id);
+    } catch (error) {
+      setFeedback(toUserMessage(error));
       return;
     }
 
@@ -328,6 +389,30 @@ export default function App() {
     setUserMode('OFFLINE');
     setScreen('home');
     setFeedback('Request cancelled. You are now offline.');
+  };
+
+  const handleSubmitRating = async () => {
+    if (!activeRequest) {
+      setFeedback('No active request to rate.');
+      return;
+    }
+    if (selectedRating < 1) {
+      setFeedback('Tap the stars to rate this request first.');
+      return;
+    }
+
+    try {
+      await completeRequestRemote(activeRequest.id);
+      await submitRatingRemote(activeRequest.id, selectedRating, ratingComment);
+      setFeedback('Thanks! Your rating keeps the community strong.');
+      setSelectedRating(0);
+      setRatingComment('');
+      setActiveRequest(null);
+      setUserMode('OFFLINE');
+      setScreen('home');
+    } catch (error) {
+      setFeedback(toUserMessage(error));
+    }
   };
 
   const renderHeader = (title: string) => (
@@ -392,13 +477,24 @@ export default function App() {
       <Text style={styles.onboardingTitle}>Let’s get you connected 👋</Text>
       <Text style={styles.onboardingText}>Your account keeps requests, rewards, and people you meet in one safe place.</Text>
       <View style={styles.onboardingCard}>
-        <Text style={styles.formIcon}>🧑‍💻</Text>
-        <Text style={styles.label}>Full name</Text><TextInput style={styles.input} value={userName} editable={false} />
-        <Text style={styles.label}>📱 Phone number</Text><TextInput style={styles.input} value="+91 98765 43210" editable={false} />
-        <Text style={styles.label}>✉️ Email address</Text><TextInput style={styles.input} value="aman@studenthostel.com" editable={false} />
+        <Text style={styles.formIcon}>✉️</Text>
+        <Text style={styles.label}>Email address</Text>
+        <TextInput
+          style={styles.input}
+          placeholder="you@example.com"
+          placeholderTextColor="#64748b"
+          keyboardType="email-address"
+          autoCapitalize="none"
+          autoComplete="email"
+          value={magicEmail}
+          onChangeText={setMagicEmail}
+        />
+        <Text style={styles.mutedText}>We will email you a secure sign-in link. No passwords needed.</Text>
       </View>
       <Text style={styles.privacyNote}>🔒 Your details are encrypted and never sold.</Text>
-      <Pressable style={styles.primaryButton} onPress={handleLogin}><Text style={styles.primaryButtonText}>Continue to verification →</Text></Pressable>
+      <Pressable style={styles.primaryButton} disabled={isSigningIn} onPress={handleSendMagicLink}>
+        {isSigningIn ? <ActivityIndicator color="#082f49" /> : <Text style={styles.primaryButtonText}>Send my sign-in link →</Text>}
+      </Pressable>
     </ScrollView>
   );
 
@@ -432,7 +528,7 @@ export default function App() {
   const renderHome = () => (
     <ScrollView contentContainerStyle={styles.scrollContent}>
       {renderHeader('Home')}
-      <Text style={styles.greeting}>Hello, {userName} 👋</Text>
+      <Text style={styles.greeting}>Hello, {profileName} 👋</Text>
       {userMode === 'OFFLINE' && (
         <View style={styles.offlineHero}>
           <View style={styles.offlineMoon}><Text style={styles.offlineMoonEmoji}>🌙</Text></View>
@@ -472,7 +568,7 @@ export default function App() {
       {renderHeader('Ready Control Room')}
       <View style={styles.readyHero}>
         <View style={styles.readyHeroTop}><Text style={styles.readyEyebrow}>🟢 YOU ARE LIVE</Text><Text style={styles.readyPulse}>● LIVE</Text></View>
-        <Text style={styles.readyHeroTitle}>Ready to help, {userName}?</Text>
+        <Text style={styles.readyHeroTitle}>Ready to help, {profileName}?</Text>
         <Text style={styles.readyHeroText}>Nearby requests are being matched to you in real time.</Text>
         <View style={styles.readyLocation}><Text style={styles.readyLocationIcon}>📍</Text><Text style={styles.readyLocationText}>{currentLocation ? `${currentLocation.latitude.toFixed(3)}, ${currentLocation.longitude.toFixed(3)} · 1 km radius` : 'Location permission needed · 1 km radius'}</Text><Text style={styles.readyLocationCheck}>{currentLocation ? '✓' : '!'}</Text></View>
       </View>
@@ -596,7 +692,7 @@ export default function App() {
       <Pressable style={styles.primaryButton} onPress={() => setScreen('complete')}>
         <Text style={styles.primaryButtonText}>{userMode === 'NEEDY' ? '✅ Confirm arrival' : '📍 Mark as arrived'}</Text>
       </Pressable>
-      {userMode === 'NEEDY' && <Pressable style={styles.cancelButton} onPress={handleCancelRequest}><Text style={styles.cancelButtonText}>Cancel this request</Text></Pressable>}
+      {userMode === 'NEEDY' && <Pressable style={styles.cancelButton} onPress={() => void handleCancelRequest()}><Text style={styles.cancelButtonText}>Cancel this request</Text></Pressable>}
     </ScrollView>
   );
 
@@ -617,8 +713,11 @@ export default function App() {
         multiline
         numberOfLines={4}
         placeholder="Optional comment"
+        placeholderTextColor="#64748b"
+        value={ratingComment}
+        onChangeText={setRatingComment}
       />
-      <Pressable style={styles.primaryButton} onPress={() => setScreen('home')}>
+      <Pressable style={styles.primaryButton} onPress={handleSubmitRating}>
         <Text style={styles.primaryButtonText}>Submit rating</Text>
       </Pressable>
     </ScrollView>
@@ -632,8 +731,8 @@ export default function App() {
           <Text style={styles.avatarEmoji}>🧑🏽‍💻</Text>
         </View>
         <View style={styles.profileIdentity}>
-          <Text style={styles.profileName}>{userName} 👋</Text>
-          <Text style={styles.profileHandle}>@aman.ready · New Delhi 📍</Text>
+          <Text style={styles.profileName}>{profileName} 👋</Text>
+          <Text style={styles.profileHandle}>{authEmail || 'Connect your account to sync'} 📍</Text>
           <Text style={styles.profileStatus}>✅ Identity verified</Text>
         </View>
         <Pressable style={styles.editButton} onPress={() => setScreen('settings')}>
@@ -730,7 +829,7 @@ export default function App() {
       <Pressable style={styles.logoutButton} onPress={handleSignOut}>
         <Text style={styles.logoutButtonText}>🚪 Log out</Text>
       </Pressable>
-      <Text style={styles.accountFooter}>READY/NEEDY v1.0 · Made for people who show up 💙</Text>
+      <Text style={styles.accountFooter}>READY/NEEDY v{APP_VERSION} · Made for people who show up 💙</Text>
     </ScrollView>
   );
 
@@ -746,7 +845,7 @@ export default function App() {
       <Text style={styles.accountSectionTitle}>🔐 Privacy & location</Text>
       <View style={styles.accountPanel}><View style={styles.accountRow}><Text style={styles.accountRowIcon}>📍</Text><View style={styles.accountRowCopy}><Text style={styles.accountRowTitle}>Share location while Ready</Text><Text style={styles.accountRowSubtitle}>Only used to match you with nearby people.</Text></View><Pressable style={[styles.toggle, locationSharingEnabled && styles.toggleOn]} onPress={handleLocationToggle}><Text style={styles.toggleKnob}>{locationSharingEnabled ? '●' : '○'}</Text></Pressable></View><View style={styles.accountDivider} /><View style={styles.accountRow}><Text style={styles.accountRowIcon}>🛡️</Text><View style={styles.accountRowCopy}><Text style={styles.accountRowTitle}>Identity & data</Text><Text style={styles.accountRowSubtitle}>Your ID and account data are protected.</Text></View><Text style={styles.verifiedText}>Secure ✓</Text></View></View>
       <Text style={styles.accountSectionTitle}>📱 App</Text>
-      <View style={styles.accountPanel}><View style={styles.accountRow}><Text style={styles.accountRowIcon}>🌐</Text><View style={styles.accountRowCopy}><Text style={styles.accountRowTitle}>Language</Text><Text style={styles.accountRowSubtitle}>The app currently uses English.</Text></View><Text style={styles.accountRowValue}>English ›</Text></View><View style={styles.accountDivider} /><View style={styles.accountRow}><Text style={styles.accountRowIcon}>ℹ️</Text><View style={styles.accountRowCopy}><Text style={styles.accountRowTitle}>Version</Text><Text style={styles.accountRowSubtitle}>READY/NEEDY production build</Text></View><Text style={styles.accountRowValue}>1.0.0</Text></View></View>
+      <View style={styles.accountPanel}><View style={styles.accountRow}><Text style={styles.accountRowIcon}>🌐</Text><View style={styles.accountRowCopy}><Text style={styles.accountRowTitle}>Language</Text><Text style={styles.accountRowSubtitle}>The app currently uses English.</Text></View><Text style={styles.accountRowValue}>English ›</Text></View><View style={styles.accountDivider} /><View style={styles.accountRow}><Text style={styles.accountRowIcon}>ℹ️</Text><View style={styles.accountRowCopy}><Text style={styles.accountRowTitle}>Version</Text><Text style={styles.accountRowSubtitle}>READY/NEEDY production build</Text></View><Text style={styles.accountRowValue}>{APP_VERSION}</Text></View></View>
       <Pressable style={styles.secondaryButton} onPress={() => setScreen('account')}><Text style={styles.secondaryButtonText}>← Back to account</Text></Pressable>
     </ScrollView>
   );

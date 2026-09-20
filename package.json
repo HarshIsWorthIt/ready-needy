@@ -18,13 +18,16 @@
   "devDependencies": {
     "@expo/cli": "^57.0.26",
     "@types/react": "~19.2.2",
+    "expo-module-scripts": "^56.0.3",
     "typescript": "~6.0.3"
   },
   "scripts": {
     "start": "node ./node_modules/expo/bin/cli start --port 8082",
     "android": "node ./node_modules/expo/bin/cli start --android --port 8082",
     "ios": "node ./node_modules/expo/bin/cli start --ios --port 8082",
-    "web": "node ./node_modules/expo/bin/cli start --web --port 8082"
+    "web": "node ./node_modules/expo/bin/cli start --web --port 8082",
+    "typecheck": "tsc --noEmit",
+    "typecheck:functions": "tsc -p supabase/functions/tsconfig.json"
   },
   "private": true
 }
