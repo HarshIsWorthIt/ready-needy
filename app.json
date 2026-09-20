@@ -3,13 +3,54 @@
     "name": "ready-needy",
     "slug": "ready-needy",
     "version": "1.0.0",
+    "scheme": "readynedy",
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow READY/NEEDY to use your camera to verify your identity.",
+          "microphonePermission": "Allow READY/NEEDY to use your microphone when needed.",
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow READY/NEEDY to find nearby people when you choose Ready mode."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "defaultChannel": "dispatch",
+          "enableBackgroundRemoteNotifications": true
+        }
+      ],
+      "expo-secure-store"
+    ],
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "READY/NEEDY uses your location to match you with nearby people.",
+        "NSUserTrackingUsageDescription": "READY/NEEDY uses your location to improve nearby dispatch.",
+        "UIBackgroundModes": [
+          "remote-notification"
+        ]
+      }
     },
     "android": {
+      "package": "com.readyneedy.app",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "POST_NOTIFICATIONS",
+        "android.permission.CAMERA",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -20,6 +61,11 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "ad557f34-0974-4751-ad9b-34d0b0671a78"
+      }
     }
   }
 }
